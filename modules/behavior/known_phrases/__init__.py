@@ -1,0 +1,7 @@
+from .ru import ALL_KNOWN_PHRASES as RU_KNOWN_PHRASES
+from .en import ALL_KNOWN_PHRASES as EN_KNOWN_PHRASES
+
+ALL_KNOWN_PHRASES = {
+    "ru": RU_KNOWN_PHRASES,
+    "en": EN_KNOWN_PHRASES,
+}
