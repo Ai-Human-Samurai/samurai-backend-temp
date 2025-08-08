@@ -1,135 +1,95 @@
-import openai
-from core.logger import logger
+import os
+from openai import OpenAI, OpenAIError
+
 from core.credentials import OPENAI_API_KEY
-from modules.voice_cache import save_mp3_file
-from modules.behavior_engine import get_phrase
-from modules.emotion_detector import should_block_emotion, log_emotional_appeal
-from modules.flood_guard import guard, check_meaning
+from modules.voice_cache import save_mp3_file, get_voice_cache_path  # get_voice_cache_path нужен для пути
+from modules.flood_guard import check_meaning
+from modules.emotion_detector import should_block_emotion
 from modules.behavior.style_map import resolve_style
 from prompts import load_prompts
 
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def is_toxic(text: str, lang: str = "ru") -> bool:
-    prompts = load_prompts(lang)
-    bad_words = prompts["semantic_filter"]["BAD_WORDS"]
-    return any(word in text.lower() for word in bad_words)
+def is_text_blocked(user_id: int, text: str, lang: str = "ru", db=None) -> bool:
+    if not text:
+        return True
+    text = text.strip().lower()
+    bad_words = load_prompts(lang).get("filters", {}).get("BAD_WORDS", [])
+    return any(w in text for w in bad_words)
 
 
-def check_semantic_toxicity(text: str, lang: str = "ru") -> bool:
+def style_to_voice(style: str = "дружественный", lang: str = "ru") -> str:
+    style = style.lower().strip()
+    if lang == "ru":
+        return {
+            "сухой": "nova",
+            "официальный": "aidar",
+            "дружественный": "baya",
+        }.get(style, "baya")
+    elif lang == "en":
+        return {
+            "dry": "echo",
+            "formal": "onyx",
+            "friendly": "alloy",
+        }.get(style, "alloy")
+    return "alloy"
+
+
+def generate_and_save_voice(
+    text: str,
+    user_id: int,
+    lang: str = "ru",
+    style: str = "дружественный",
+) -> str | None:
+    """
+    Generate TTS and save MP3 to cache. Returns absolute file path or None.
+    Uses streaming write to avoid API response handling quirks.
+    """
+    # ⛳ временно можно выключить фильтры, если нужно исключить их влияние
+    if is_text_blocked(user_id, text, lang):
+        print("⛔ Blocked by toxic filter")
+        return None
+
+    if not check_meaning(text, lang=lang):
+        print("⛔ Blocked by semantic filter")
+        return None
+
+    if should_block_emotion(text, user_id=user_id, lang=lang):
+        print("⛔ Blocked by emotion filter")
+        return None
+
+    style = resolve_style(style, lang)
+    voice = style_to_voice(style, lang)
+
+    # путь к файлу кэша (учитываем голос)
     try:
-        prompts = load_prompts(lang)
-        system_prompt = prompts["semantic_filter"]["SEMANTIC_FILTER_PROMPT"]
+        cache_path = get_voice_cache_path(text=text, lang=lang, voice=voice)
+    except TypeError:
+        # если у тебя старая сигнатура get_voice_cache_path без voice — срочно обнови voice_cache.py
+        # на версию с (text, lang, voice)
+        print("⚠️ get_voice_cache_path() без voice — обнови modules/voice_cache.py")
+        return None
 
-        completion = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            temperature=0,
-            max_tokens=5
-        )
-        result = completion.choices[0].message.content.strip().upper()
-        return result == "TRUE"
-    except Exception as e:
-        logger.error(f"[GPT-Filter] Semantic check failed: {e}")
-        return False
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-
-def is_text_blocked(text: str, lang: str = "ru") -> bool:
-    return is_toxic(text, lang=lang) or check_semantic_toxicity(text, lang=lang)
-
-
-def style_to_voice(normalized_style: str) -> str:
-    mapping = {
-        "friendly": "onyx",
-        "formal": "onyx",
-        "dry": "onyx",
-    }
-    return mapping.get(normalized_style.lower().strip(), "nova")
-
-
-def synthesize_voice(text: str, voice: str = "nova") -> bytes | None:
+    print(f"🎙️ TTS try: model='tts-1', voice='{voice}', lang='{lang}', text='{text}'")
     try:
-        logger.info(f"[TTS] Synthesizing voice={voice}, text={text[:30]}...")
-        response = openai.audio.speech.create(
-            model="tts-1",
+        # надёжный способ: streaming → сразу в файл
+        with client.audio.speech.with_streaming_response.create(
+            model="tts-1",          # или "gpt-4o-mini-tts" если включена
             voice=voice,
-            input=text
-        )
-        return response.read()
+            input=text,
+        ) as resp:
+            resp.stream_to_file(cache_path)
+
+        exists = os.path.exists(cache_path)
+        print(f"✅ TTS done, file_exists={exists}, path={cache_path}")
+        return cache_path if exists else None
+
+    except OpenAIError as e:
+        print("❌ OpenAI TTS error:", repr(e))
+        return None
     except Exception as e:
-        logger.error(f"[TTS] synthesis failed (voice={voice}, text={text[:30]}): {e}")
+        print("❌ TTS unexpected error:", repr(e))
         return None
-
-
-def save_blocked_voice(lang: str = "ru") -> str | None:
-    prompts = load_prompts(lang)
-    text = prompts["system"]["BLOCKED_MESSAGE"]
-    voice = style_to_voice("dry")
-
-    audio_bytes = synthesize_voice(text=text, voice=voice)
-    if not audio_bytes:
-        return None
-
-    return save_mp3_file(audio_bytes, text=text, lang=lang)
-
-
-def save_custom_response(text: str, lang: str = "ru") -> str | None:
-    voice = style_to_voice("dry")
-    audio_bytes = synthesize_voice(text=text, voice=voice)
-    if not audio_bytes:
-        return None
-
-    return save_mp3_file(audio_bytes, text=text, lang=lang)
-
-
-def generate_and_save_voice(user_id: int, style: str, intent: str, db, lang: str = "ru") -> str | None:
-    logger.info(f"[VoiceGen] Intent start: user_id={user_id}, intent={intent}, style={style}, lang={lang}")
-    style = resolve_style(style, lang)
-    phrase_data = get_phrase(style=style, intent=intent, lang=lang, user_id=user_id)
-    text = phrase_data["text"]
-
-    if is_text_blocked(text, lang=lang):
-        logger.warning(f"[BlockedIntentText] {text}")
-        return save_blocked_voice(lang)
-
-
-
-    log_emotional_appeal(db, user_id, detail=f"intent={intent}")
-
-    flood_reply = guard.update(user_id, is_meaningful=check_meaning(text), lang=lang)
-    if flood_reply:
-        return save_custom_response(flood_reply, lang)
-
-    voice_name = "onyx"
-    audio_bytes = synthesize_voice(text=text, voice=voice_name)
-    if not audio_bytes:
-        return None
-
-    return save_mp3_file(audio_bytes, text=text, lang=lang)
-
-
-def generate_custom_voice(user_id: int, text: str, style: str = "friendly", db=None, lang: str = "ru") -> str | None:
-    logger.info(f"[VoiceGen] Custom start: user_id={user_id}, style={style}, lang=lang, text={text}")
-    style = resolve_style(style, lang)
-
-    if is_text_blocked(text, lang=lang):
-        logger.warning(f"[BlockedCustomText] {text}")
-        return save_blocked_voice(lang)
-
-
-    log_emotional_appeal(db, user_id, detail="custom")
-
-    flood_reply = guard.update(user_id, is_meaningful=check_meaning(text), lang=lang)
-    if flood_reply:
-        return save_custom_response(flood_reply, lang)
-
-    voice_name = style_to_voice(style)
-    audio_bytes = synthesize_voice(text=text, voice=voice_name)
-    if not audio_bytes:
-        return None
-
-    return save_mp3_file(audio_bytes, text=text, lang=lang)

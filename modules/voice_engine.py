@@ -1,64 +1,66 @@
-from sqlalchemy.orm import Session
-from modules.voice_module import generate_custom_voice
-from modules.voice_cache import is_voice_cached, get_voice_cache_path
-from modules.cached_responses import get_cached_phrase
-from modules.behavior.style_map import resolve_style
-import os
+import random
+from modules.voice_module import (
+    generate_and_save_voice,
+    save_mp3_file,
+    style_to_voice,
+    is_text_blocked,
+)
+from modules.voice_cache import (
+    get_voice_cache_path,
+    is_voice_cached,
+)
+from prompts import load_prompts
 
 
 def play_or_generate_voice(
     user_id: int,
-    text: str,
-    style: str,
-    lang: str,
-    db: Session
+    key: str = None,
+    lang: str = "ru",
+    style: str = "дружественный",
+    text: str = None,
+    db=None,
 ) -> dict:
-   
+    """
+    Возвращает голосовую фразу по ключу или произвольному тексту.
+    Проверяет кэш, генерирует при необходимости.
     
-    style = resolve_style(style, lang)
-    text = text.strip()
-
-    if is_voice_cached(text, lang):
-        path = get_voice_cache_path(text, lang)
-        return {
-            "status": "ok",
-            "path": _url_from_path(path),
-            "text": None
+    Возвращает:
+        {
+            "text": "сама фраза",
+            "path": "путь к mp3 или None"
         }
+    """
+    prompts = load_prompts(lang)
+    phrase = None
 
-    cached = get_cached_phrase(db, text, style, lang)
-    if cached:
-        if is_voice_cached(cached, lang):
-            path = get_voice_cache_path(cached, lang)
-            return {
-                "status": "ok",
-                "path": _url_from_path(path),
-                "text": cached
-            }
+    # 🧠 1. Выбор фразы
+    if key:
+        phrase_list = prompts.get(key, [])
+        phrase = random.choice(phrase_list) if isinstance(phrase_list, list) else phrase_list
+    elif text:
+        phrase = text.strip()
+    else:
+        return {"text": None, "path": None}
 
-        path = generate_custom_voice(user_id, text=cached, style=style, lang=lang, db=db)
-        if path:
-            return {
-                "status": "ok",
-                "path": _url_from_path(path),
-                "text": cached
-            }
+    # 🚫 2. Фильтрация (токсичность, флад и пр.)
+    if is_text_blocked(user_id=user_id, text=phrase, lang=lang, db=db):
+        return {"text": None, "path": None}
 
-    path = generate_custom_voice(user_id, text=text, style=style, lang=lang, db=db)
-    if path:
-        return {
-            "status": "ok",
-            "path": _url_from_path(path),
-            "text": text
-        }
+    # 🔊 3. Кэш
+    voice = style_to_voice(style, lang)
+    cache_path = get_voice_cache_path(text=phrase, lang=lang, voice=voice)
 
-    return {
-        "status": "text",
-        "path": None,
-        "text": text
-    }
+    if is_voice_cached(text=phrase, lang=lang, voice=voice):
+        return {"text": phrase, "path": cache_path}
 
-
-def _url_from_path(path: str) -> str:
-    filename = os.path.basename(path)
-    return f"/static/voice_cache/{filename}"
+    # 🎤 4. Генерация
+    try:
+        generate_and_save_voice(
+            text=phrase,
+            user_id=user_id,
+            voice=voice,
+            lang=lang,
+        )
+        return {"text": phrase, "path": cache_path}
+    except Exception:
+        return {"text": phrase, "path": None}
