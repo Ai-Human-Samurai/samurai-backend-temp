@@ -62,7 +62,6 @@ def add_memory(
 
     return new_thought
 
-# 📃 List memories
 @router.get("/list", response_model=List[MemoryThoughtOut])
 def list_memories(
     user_id: int = Query(...),
@@ -74,7 +73,6 @@ def list_memories(
         .order_by(MemoryThought.created_at.desc())\
         .all()
 
-# ❌ Delete memory
 @router.delete("/delete/{thought_id}")
 def delete_memory(
     thought_id: int,
@@ -93,7 +91,7 @@ def delete_memory(
     db.commit()
     return {"success": True, "deleted_id": thought_id}
 
-# 🔁 Upload audio
+
 @router.post("/upload", response_model=MemoryThoughtOut)
 def upload_memory(
     file: UploadFile = File(...),
@@ -119,7 +117,6 @@ def upload_memory(
     db.refresh(thought)
     return thought
 
-# 🔊 Serve audio
 @router.get("/audio/{thought_id}")
 def get_memory_audio(
     thought_id: int,

@@ -1,5 +1,11 @@
+# routes/sos.py
+# All comments in English
+
+from __future__ import annotations
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+
 from database.db import get_db
 from modules.users import get_or_create_user
 from modules.behavior.sos import trigger_sos_response
@@ -10,30 +16,28 @@ router = APIRouter()
 
 @router.post("/sos/trigger")
 def sos_trigger(
-    user_id: int = Depends(get_or_create_user),
-    db: Session = Depends(get_db)
+    user_id: int,
+    db: Session = Depends(get_db),
 ):
-    """
-    Triggers a voice-based SOS response (1–2 короткие фразы поддержки).
-    Может быть заблокировано при частом повторе.
-    """
-    # Получаем пользователя и язык
-    from modules.users import get_user_by_id
-    user = get_user_by_id(user_id, db)
-    lang = user.language if user and user.language else "ru"
-    PROMPT = load_prompts(lang).get("sos", {})
+    # Ensure user exists and fetch language
+    user = get_or_create_user(user_id, db)
+    lang = getattr(user, "language", None) or "ru"
 
-    result = trigger_sos_response(user_id=user_id, db=db)
+    store = load_prompts(lang)
+    prompt = store.get("sos", {})  # to read SOS_TOO_SOON if needed
+
+    # Note: trigger_sos_response signature must match your implementation
+    result = trigger_sos_response(user_id=user_id, lang=lang, style=None, db=db)
 
     if result.get("blocked"):
         return {
             "ok": False,
             "reason": "blocked",
-            "message": PROMPT.get("SOS_TOO_SOON", "I'm here.")
+            "message": prompt.get("SOS_TOO_SOON", "Я рядом."),
         }
 
     return {
         "ok": True,
         "text": result["text"],
-        "mp3": result["path"]
+        "mp3": result["path"],
     }

@@ -1,6 +1,9 @@
 # routes/reminders.py
+# All comments in English
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from datetime import datetime
 
@@ -10,7 +13,7 @@ from modules.reminders import (
     create_reminder,
     get_upcoming_reminders,
     mark_reminder_completed,
-    delete_reminder
+    delete_reminder,
 )
 
 router = APIRouter()
@@ -21,17 +24,17 @@ def api_create_reminder(
     user_id: int,
     text: str,
     time: datetime,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     user = get_user_or_404(user_id, db)
-    reminder = create_reminder(db, user.id, text, time)
+    reminder = create_reminder(db, user.id, text, time)  # keep your signature
     return {"status": "ok", "id": reminder.id}
 
 
 @router.get("/list")
 def api_get_reminders(
     user_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     get_user_or_404(user_id, db)
     reminders = get_upcoming_reminders(db, user_id)
@@ -42,7 +45,7 @@ def api_get_reminders(
             "time": r.time,
             "seen": r.is_seen,
             "played": r.is_played,
-            "completed": r.is_completed
+            "completed": r.is_completed,
         }
         for r in reminders
     ]
@@ -51,7 +54,7 @@ def api_get_reminders(
 @router.patch("/complete")
 def api_complete_reminder(
     reminder_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     mark_reminder_completed(db, reminder_id)
     return {"status": "completed"}
@@ -60,7 +63,7 @@ def api_complete_reminder(
 @router.delete("/delete")
 def api_delete_reminder(
     reminder_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     delete_reminder(db, reminder_id)
     return {"status": "deleted"}

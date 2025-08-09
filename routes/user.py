@@ -10,7 +10,6 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="", tags=["User"])
 
-# ✅ Регистрация нового пользователя
 @router.post("/register")
 def register_user(
     lang: str = Query(default="ru"),
@@ -35,7 +34,6 @@ def register_user(
         "pro_until": user.pro_until
     }
 
-# ✅ Получить профиль пользователя
 @router.get("/profile")
 def get_user_profile(
     user_id: int = Query(...),
@@ -51,7 +49,6 @@ def get_user_profile(
         "pro_until": user.pro_until
     }
 
-# ✅ Список доступных голосов
 @router.get("/voices/list")
 def list_voices():
     return [
@@ -59,7 +56,6 @@ def list_voices():
         for voice in AVAILABLE_VOICES
     ]
 
-# ✅ Обновление настроек (голос)
 class SettingsUpdate(BaseModel):
     voice: str
 
