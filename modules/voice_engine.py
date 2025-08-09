@@ -1,66 +1,77 @@
-import random
-from modules.voice_module import (
-    generate_and_save_voice,
-    save_mp3_file,
-    style_to_voice,
-    is_text_blocked,
-)
-from modules.voice_cache import (
-    get_voice_cache_path,
-    is_voice_cached,
-)
-from prompts import load_prompts
+import os
+import logging
+from typing import Optional
+from sqlalchemy.orm import Session
+
+from modules.voice_module import generate_custom_voice, generate_and_save_voice
+from modules.voice_cache import is_voice_cached, get_voice_cache_path
+from modules.behavior.style_map import resolve_style, style_to_voice
+from modules.behavior_engine import get_phrase
+from modules.semantic_filter import is_text_blocked
+
+logger = logging.getLogger("samurai.voice.engine")
+
+
+def _url_from_path(path: str) -> str:
+    # /static смонтирован на саму папку voice_cache → публикуем только имя файла
+    filename = os.path.basename(path)
+    return f"/static/{filename}"
 
 
 def play_or_generate_voice(
     user_id: int,
-    key: str = None,
+    text: Optional[str] = None,
+    intent: Optional[str] = None,
     lang: str = "ru",
     style: str = "дружественный",
-    text: str = None,
-    db=None,
+    db: Optional[Session] = None,
 ) -> dict:
     """
-    Возвращает голосовую фразу по ключу или произвольному тексту.
-    Проверяет кэш, генерирует при необходимости.
-    
-    Возвращает:
-        {
-            "text": "сама фраза",
-            "path": "путь к mp3 или None"
-        }
+    Единая точка TTS:
+      1) фраза (если intent),
+      2) фильтры,
+      3) кэш (учитывает voice),
+      4) генерация,
+      5) {status, path?, text?, intent?, message?}
     """
-    prompts = load_prompts(lang)
-    phrase = None
+    style = resolve_style(style, lang)
+    phrase_text = (text or "").strip()
 
-    # 🧠 1. Выбор фразы
-    if key:
-        phrase_list = prompts.get(key, [])
-        phrase = random.choice(phrase_list) if isinstance(phrase_list, list) else phrase_list
-    elif text:
-        phrase = text.strip()
-    else:
-        return {"text": None, "path": None}
+    # 1) Если нет явного текста — берём фразу по intent
+    if not phrase_text and intent:
+        try:
+            data = get_phrase(style=style, intent=intent, lang=lang, user_id=user_id, db=db) or {}
+            phrase_text = (data.get("text") or "").strip()
+        except Exception as e:
+            logger.error("get_phrase failed: %s", e)
 
-    # 🚫 2. Фильтрация (токсичность, флад и пр.)
-    if is_text_blocked(user_id=user_id, text=phrase, lang=lang, db=db):
-        return {"text": None, "path": None}
+    if not phrase_text:
+        return {"status": "error", "message": "NO_TEXT_OR_INTENT", "path": None, "text": None, "intent": intent}
 
-    # 🔊 3. Кэш
-    voice = style_to_voice(style, lang)
-    cache_path = get_voice_cache_path(text=phrase, lang=lang, voice=voice)
-
-    if is_voice_cached(text=phrase, lang=lang, voice=voice):
-        return {"text": phrase, "path": cache_path}
-
-    # 🎤 4. Генерация
+    # 2) Фильтры
     try:
-        generate_and_save_voice(
-            text=phrase,
-            user_id=user_id,
-            voice=voice,
-            lang=lang,
-        )
-        return {"text": phrase, "path": cache_path}
-    except Exception:
-        return {"text": phrase, "path": None}
+        if is_text_blocked(user_id, phrase_text, lang=lang, db=db):
+            return {"status": "forbidden", "message": "TEXT_BLOCKED", "path": None, "text": None, "intent": intent}
+    except Exception as e:
+        logger.error("is_text_blocked error: %s (fallback allow)", e)
+
+    # 3) Кэш (учитывает voice)
+    voice = style_to_voice(style, lang)
+    try:
+        if is_voice_cached(phrase_text, lang, voice):
+            path = get_voice_cache_path(phrase_text, lang, voice)
+            logger.info("Cache hit: %s", path)
+            return {"status": "ok", "path": _url_from_path(path), "text": phrase_text, "intent": intent}
+    except Exception as e:
+        logger.error("Cache check error: %s", e)
+
+    # 4) Генерация
+    try:
+        path = generate_and_save_voice(text=phrase_text, user_id=user_id, lang=lang, style=style)
+        if path:
+            return {"status": "ok", "path": _url_from_path(path), "text": phrase_text, "intent": intent}
+        # Фолбэк — текст
+        return {"status": "text", "path": None, "text": phrase_text, "intent": intent}
+    except Exception as e:
+        logger.error("TTS generation exception: %s", e)
+        return {"status": "error", "message": "GENERATION_FAILED", "path": None, "text": phrase_text, "intent": intent}

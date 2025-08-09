@@ -35,3 +35,19 @@ def generate_dynamic_phrase(category: str, lang: str = "ru") -> str:
         return response.choices[0].message.content.strip() if response.choices else fallback_phrase
     except OpenAIError:
         return random.choice(examples)["text"]
+    
+# ── Adapter for voice_engine ──
+try:
+    from modules.behavior_engine import get_phrase as _get_phrase_impl
+except Exception:
+    _get_phrase_impl = None
+
+def get_phrase(style: str, intent: str, lang: str, user_id: int, db=None) -> dict | None:
+    """
+    Thin adapter. Keeps legacy import path used by voice_engine.
+    Delegates to modules.behavior_engine.get_phrase(...).
+    Returns dict like {"text": "..."} or None.
+    """
+    if _get_phrase_impl is None:
+        return None
+    return _get_phrase_impl(style=style, intent=intent, lang=lang, user_id=user_id, db=db)

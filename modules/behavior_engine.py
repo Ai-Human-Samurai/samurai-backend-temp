@@ -1,30 +1,74 @@
-import random
-from modules.behavior.known_phrases import ALL_KNOWN_PHRASES
-from modules.behavior.style_map import get_style_map, resolve_style
-from modules.behavior_cache import is_recent_repeat, store_phrase
-from prompts import load_prompts
+# modules/behavior_engine.py
+# All comments in English
 
+from __future__ import annotations
+from typing import Optional, Dict, Any
+
+from prompts import load_prompts
+from helpers.prompt_utils import get_phrase as _gp
+from utils.net import is_offline
+
+# Legacy defaults (kept for callers that rely on them)
 DEFAULT_STYLE = "friendly"
 DEFAULT_LANGUAGE = "ru"
 
-CRITICAL_INTENTS = {"sos_now", "sos_breathe", "sos_hold"}
+# Critical intents that must not be cached (legacy behavior)
+_CRITICAL = {"sos_now", "sos_breathe", "sos_hold"}
 
-FALLBACK_PHRASE = "..."
 
+def _intent_to_path(store: Dict[str, Any], intent: str) -> Optional[str]:
+    """
+    Best-effort mapping from legacy 'intent' names to unified prompt paths
+    understood by helpers.prompt_utils.get_phrase().
 
-def detect_identity_intent(text: str, lang: str) -> str | None:
-    
-    lowered = text.lower()
-    triggers = load_prompts(lang)["intents"].get("identity_triggers", {})
-    for intent_key, keywords in triggers.items():
-        if any(k in lowered for k in keywords):
-            return intent_key
+    Returns a dotted path like:
+      - known_phrases.reminders.reminder_confirm
+      - presence.presence_morning
+      - known_phrases.identity.who_are_you
+      - sos
+    or None if no direct path mapping is known (we will try raw traversal later).
+    """
+
+    # reminders.*
+    if intent.startswith("reminder_"):
+        # e.g. reminder_confirm, reminder_done, ...
+        return f"known_phrases.reminders.{intent}"
+
+    # presence.*
+    if intent.startswith("presence_"):
+        # e.g. presence_morning, presence_idle, are_you_there
+        return f"presence.{intent}"
+
+    # SOS buckets (list lives in store['sos']['SOS_PHRASES'])
+    if intent in {"sos_now", "sos_breathe", "sos_hold", "sos"}:
+        return "sos"
+
+    # identity buckets discovered dynamically from loaded prompts
+    identity = (store.get("known_phrases") or {}).get("identity") or {}
+    if isinstance(identity, dict) and intent in identity:
+        return f"known_phrases.identity.{intent}"
+
+    # Fallback: no explicit mapping — let caller try raw traversal or default
     return None
 
 
-def store_if_needed(user_id: int | None, intent: str, value: str):
-    if user_id:
-        store_phrase(user_id, intent, value)
+def _infer_identity_from_text(store: Dict[str, Any], text: str) -> Optional[str]:
+    """
+    Lightweight identity intent detection via triggers located in prompts.intents.
+    Returns an identity key (e.g., 'who_are_you') or None.
+    """
+    if not text:
+        return None
+    intents_payload = (store.get("intents") or {}).get("identity_triggers", {}) or {}
+    lowered = text.lower()
+    for ident_key, keywords in intents_payload.items():
+        try:
+            if any(k in lowered for k in keywords):
+                return ident_key
+        except Exception:
+            # Defensive: skip malformed keywords
+            continue
+    return None
 
 
 def get_phrase(
@@ -32,91 +76,53 @@ def get_phrase(
     intent: str,
     lang: str = DEFAULT_LANGUAGE,
     text: str = "",
-    user_id: int | None = None
-) -> dict:
-    is_critical = intent in CRITICAL_INTENTS
-    prompts = load_prompts(lang)
+    user_id: int | None = None,
+) -> Dict[str, Any]:
+    """
+    Legacy-compatible get_phrase() that delegates phrase retrieval to
+    helpers.prompt_utils.get_phrase() with:
+      - anti-repeat
+      - offline fallback
+      - dynamic identity detection
 
-    # 🧠 Проверка identity-интента
-    identity_intent = detect_identity_intent(text, lang)
-    if identity_intent:
-        phrases = prompts["known_phrases"]["identity"].get(identity_intent)
-        if phrases:
-            value = random.choice(phrases)
-            store_if_needed(user_id, identity_intent, value)
-            return {
-                "text": value,
-                "style": resolve_style("dry", lang),
-                "intent": identity_intent,
-                "critical": False,
-                "cacheable": True,
-                "priority": 1,
-            }
+    Returns a dict (legacy shape):
+      {
+        "text": str,           # chosen phrase or "..."
+        "style": str,          # as given (no heavy style resolution here)
+        "intent": str,         # may be tightened if identity inferred from text
+        "critical": bool,      # True for SOS-like intents
+        "cacheable": bool,     # False for critical intents
+        "priority": int,       # 1 by default
+      }
+    """
+    store = load_prompts(lang)
+    offline_flag = is_offline()
 
-    if is_critical and "SOS_PHRASES" in prompts:
-        value = random.choice(prompts["SOS_PHRASES"])
-        store_if_needed(user_id, intent, value)
-        return {
-            "text": value,
-            "style": resolve_style("friendly", lang),
-            "intent": intent,
-            "critical": True,
-            "cacheable": False,
-            "priority": 2,
-        }
+    # 1) Map legacy intent → unified path and try direct fetch
+    path = _intent_to_path(store, intent)
+    phrase_text: Optional[str] = None
+    if path:
+        phrase_text = _gp(store, path, offline=offline_flag, default=None)
 
-    resolved_style = resolve_style(DEFAULT_STYLE if is_critical else style, lang)
-    style_prompts = get_style_map(lang).get(resolved_style) or {}
+    # 2) If nothing found yet, try to infer identity by the raw text and fetch
+    if not phrase_text and text:
+        inferred = _infer_identity_from_text(store, text)
+        if inferred:
+            path2 = f"known_phrases.identity.{inferred}"
+            phrase_text = _gp(store, path2, offline=offline_flag, default=None)
+            if phrase_text:
+                intent = inferred  # tighten the returned intent label
 
-    phrase_set = style_prompts.get(intent)
+    # 3) Last resort: try raw traversal using the legacy intent as a dotted path,
+    #    or return default "..."
+    if not phrase_text:
+        # This allows advanced callers to pass direct paths like "presence.are_you_there"
+        phrase_text = _gp(store, intent, offline=offline_flag, default="...")
 
-    if not phrase_set:
-        known = ALL_KNOWN_PHRASES.get(lang, {}).get(intent)
-        if known:
-            value = random.choice(known["text"])
-            if user_id and is_recent_repeat(user_id, intent, value):
-                return {
-                    "text": FALLBACK_PHRASE,
-                    "style": resolved_style,
-                    "intent": intent,
-                    "critical": is_critical,
-                    "cacheable": False,
-                    "priority": 0,
-                }
-            store_if_needed(user_id, intent, value)
-            return {
-                "text": value,
-                "style": resolved_style,
-                "intent": intent,
-                "critical": is_critical,
-                "cacheable": True,
-                "priority": known.get("priority", 1),
-            }
-
-        return {
-            "text": FALLBACK_PHRASE,
-            "style": resolved_style,
-            "intent": intent,
-            "critical": is_critical,
-            "cacheable": False,
-            "priority": 0,
-        }
-
-    value = random.choice(phrase_set) if isinstance(phrase_set, list) else phrase_set
-    if user_id and is_recent_repeat(user_id, intent, value):
-        return {
-            "text": FALLBACK_PHRASE,
-            "style": resolved_style,
-            "intent": intent,
-            "critical": is_critical,
-            "cacheable": False,
-            "priority": 0,
-        }
-
-    store_if_needed(user_id, intent, value)
+    is_critical = intent in _CRITICAL
     return {
-        "text": value,
-        "style": resolved_style,
+        "text": phrase_text or "...",
+        "style": style or DEFAULT_STYLE,
         "intent": intent,
         "critical": is_critical,
         "cacheable": not is_critical,
